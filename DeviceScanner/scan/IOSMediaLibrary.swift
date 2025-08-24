@@ -12,18 +12,30 @@ import UniformTypeIdentifiers
 /// Handles opening a session with an iOS device (as an ICCameraDevice) and enumerating its photos/videos.
 @MainActor
 final class IOSMediaLibrary: NSObject, ObservableObject {
-    @Published private(set) var items: [IOSMediaItem] = []
     @Published private(set) var isLoading: Bool = true
     @Published private(set) var deviceName: String = "iOS Device"
     @Published private(set) var errorMessage: String?
 
+    // Flat items are still used for backward-compatibility with existing UI,
+    // but folder-first UI consumes folder APIs below.
+    @Published private(set) var items: [IOSMediaItem] = []
+
     private let camera: ICCameraDevice
     private let logger: Logger
+
+    // Map camera files to flat "items" indices (for openFile)
     private var fileToIndexMap: [ICCameraFile: Int] = [:]
-    private var sessionOpened = false
-    
-    // Track thumbnail requests to avoid duplicates
+
+    // Folders
+    private var topLevelFolders: [ICCameraFolder] = []
+    private var folderIdToFolder: [IOSFolderID: ICCameraFolder] = [:]
+    private var folderIdToFiles: [IOSFolderID: [ICCameraFile]] = [:]
+
+    // Thumbnails
     private var thumbnailRequests: Set<String> = []
+    private var thumbnailCache: [String: NSImage] = [:] // fileName -> NSImage
+
+    private var sessionOpened = false
 
     init(camera: ICCameraDevice, logger: Logger) {
         self.camera = camera
@@ -33,26 +45,28 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
         self.camera.delegate = self
         openSession()
     }
-    
+
     deinit {
         if sessionOpened {
             camera.requestCloseSession()
         }
     }
 
+    // MARK: - Public (old) interface kept for compatibility
+
     func allItems() -> [IOSMediaItem] {
         return items
     }
-    
+
     /// Downloads a file from the device to a temporary location and opens it
     func openFile(at index: Int, completion: @escaping (URL?) -> Void) {
         guard index < items.count else {
             completion(nil)
             return
         }
-        
+
         let item = items[index]
-        
+
         // Find the ICCameraFile for this item
         let cameraFile = fileToIndexMap.first { $0.value == index }?.key
         guard let file = cameraFile else {
@@ -60,12 +74,12 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             completion(nil)
             return
         }
-        
+
         // Create temporary directory
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("DeviceScanner")
             .appendingPathComponent(UUID().uuidString)
-        
+
         do {
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         } catch {
@@ -73,11 +87,11 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             completion(nil)
             return
         }
-        
+
         let destinationURL = tempDir.appendingPathComponent(item.name)
-        
+
         logger.log("Downloading \(item.name) to \(destinationURL.path)")
-        
+
         // Read file data into memory and write it out
         let length: off_t
         #if swift(>=5.9)
@@ -85,23 +99,23 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
         #else
         length = off_t(file.fileSize)
         #endif
-        
+
         file.requestReadData(atOffset: 0, length: length) { [weak self] data, error in
             Task { @MainActor in
                 guard let self = self else { return }
-                
+
                 if let error = error {
                     self.logger.log("Failed to read file data: \(error.localizedDescription)")
                     completion(nil)
                     return
                 }
-                
+
                 guard let data = data else {
                     self.logger.log("No data received for file")
                     completion(nil)
                     return
                 }
-                
+
                 do {
                     try data.write(to: destinationURL)
                     self.logger.log("Successfully downloaded \(item.name)")
@@ -113,6 +127,48 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             }
         }
     }
+
+    // MARK: - New folder-first APIs consumed by the view
+
+    func folders() -> [IOSMediaFolder] {
+        return topLevelFolders.map { folder in
+            let id = folderId(for: folder)
+            let files = folderIdToFiles[id] ?? []
+            var photos = false
+            var videos = false
+            for f in files {
+                let k = determineMediaKind(for: f)
+                if k == .photo { photos = true }
+                if k == .video { videos = true }
+                if photos && videos { break }
+            }
+            return IOSMediaFolder(
+                id: id,
+                name: folder.name ?? "Untitled",
+                totalCount: files.count,
+                hasPhotos: photos,
+                hasVideos: videos
+            )
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func items(in folderID: IOSFolderID, filter: MediaKind?) -> [IOSMediaItem] {
+        let files = folderIdToFiles[folderID] ?? []
+        let filteredFiles: [ICCameraFile]
+        if let filter, filter != .unknown {
+            filteredFiles = files.filter { determineMediaKind(for: $0) == filter }
+        } else {
+            filteredFiles = files
+        }
+        return makeItems(from: filteredFiles)
+    }
+
+    func displayName() -> String {
+        deviceName
+    }
+
+    // MARK: - Session / Content
 
     private func openSession() {
         logger.log("Opening session with \(self.deviceName)...")
@@ -127,11 +183,57 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             self.isLoading = false
             return
         }
-        
+
+        // Build folder tree and per-folder file lists
+        buildFolders(from: contents)
+
+        // Also build flat items for backwards compatibility with existing menus/API
         let files = flatten(items: contents)
         self.logger.log("Found \(files.count) media files")
+        self.items.removeAll()
+        self.fileToIndexMap.removeAll()
         self.processFiles(files)
         self.isLoading = false
+    }
+
+    private func buildFolders(from roots: [ICCameraItem]) {
+        topLevelFolders.removeAll()
+        folderIdToFolder.removeAll()
+        folderIdToFiles.removeAll()
+
+        for item in roots {
+            if let folder = item as? ICCameraFolder {
+                topLevelFolders.append(folder)
+                let id = folderId(for: folder)
+                folderIdToFolder[id] = folder
+                folderIdToFiles[id] = flatten(items: folder.contents ?? [])
+            } else if item is ICCameraFile {
+                // Some devices expose files at the root; group them into a pseudo-folder
+                let pseudo = ICCameraFolder()
+                pseudo.setValue("All Items", forKey: "name")
+                topLevelFolders.append(pseudo)
+                let id = folderId(for: pseudo)
+                folderIdToFolder[id] = pseudo
+                folderIdToFiles[id] = flatten(items: roots)
+                break
+            }
+        }
+
+        // If there were no folders, still expose a pseudo "All Items"
+        if topLevelFolders.isEmpty {
+            let pseudo = ICCameraFolder()
+            pseudo.setValue("All Items", forKey: "name")
+            topLevelFolders = [pseudo]
+            let id = folderId(for: pseudo)
+            folderIdToFolder[id] = pseudo
+            folderIdToFiles[id] = flatten(items: roots)
+        }
+    }
+
+    private func folderId(for folder: ICCameraFolder) -> IOSFolderID {
+        // Use an object-identity-based string to be stable during session
+        let oid = ObjectIdentifier(folder)
+        return String(oid.hashValue, radix: 16)
     }
 
     private func flatten(items: [ICCameraItem]) -> [ICCameraFile] {
@@ -146,32 +248,57 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
         return files
     }
 
-    private func processFiles(_ cameraFiles: [ICCameraFile]) {
+    // Turn camera files into display models, using thumbnail cache.
+    private func makeItems(from cameraFiles: [ICCameraFile]) -> [IOSMediaItem] {
+        var result: [IOSMediaItem] = []
         for file in cameraFiles {
             let kind = determineMediaKind(for: file)
-            
-            // Skip non-media files
             guard kind != .unknown else { continue }
 
+            let name = file.name ?? "Untitled"
+            let cachedThumb = thumbnailCache[name]
+
             let item = IOSMediaItem(
-                name: file.name ?? "Untitled",
+                name: name,
                 byteSize: file.fileSize,
                 created: file.creationDate,
                 pixelWidth: file.width as? Int,
                 pixelHeight: file.height as? Int,
                 kind: kind,
-                thumbnail: nil
+                thumbnail: cachedThumb
             )
-            
+            result.append(item)
+        }
+        return result
+    }
+
+    private func processFiles(_ cameraFiles: [ICCameraFile]) {
+        for file in cameraFiles {
+            let kind = determineMediaKind(for: file)
+            guard kind != .unknown else { continue }
+
+            let name = file.name ?? "Untitled"
+            let item = IOSMediaItem(
+                name: name,
+                byteSize: file.fileSize,
+                created: file.creationDate,
+                pixelWidth: file.width as? Int,
+                pixelHeight: file.height as? Int,
+                kind: kind,
+                thumbnail: thumbnailCache[name] // reuse if we have it
+            )
+
             items.append(item)
             let index = items.count - 1
             fileToIndexMap[file] = index
 
-            // Request thumbnail with improved error handling
-            requestThumbnail(for: file, at: index)
+            // Only request a thumbnail if not cached
+            if thumbnailCache[name] == nil {
+                requestThumbnail(for: file, at: index)
+            }
         }
     }
-    
+
     private func determineMediaKind(for file: ICCameraFile) -> MediaKind {
         guard let uti = file.uti?.lowercased() else {
             // Fallback to file extension
@@ -184,46 +311,48 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             }
             return .unknown
         }
-        
+
         if uti.contains("public.movie") || uti.contains("video") || uti.contains("quicktime") {
             return .video
         } else if uti.contains("public.image") || uti.contains("jpeg") || uti.contains("heic") ||
-                  uti.contains("png") || uti.contains("heif") {
+                    uti.contains("png") || uti.contains("heif") {
             return .photo
         }
-        
+
         return .unknown
     }
 
     private func requestThumbnail(for file: ICCameraFile, at index: Int) {
         let fileName = file.name ?? "unknown"
-        
+
         // Avoid duplicate requests
         guard !thumbnailRequests.contains(fileName) else { return }
         thumbnailRequests.insert(fileName)
-        
+
         logger.log("Requesting thumbnail for: \(fileName)")
-        
+
         // Primary: request thumbnail data directly
         file.requestThumbnailData(options: nil) { [weak self] (data: Data?, error: Error?) in
             Task { @MainActor in
                 guard let self = self,
                       index < self.items.count else { return }
-                
+
                 if let error = error {
                     self.logger.log("Thumbnail data error for \(fileName): \(error.localizedDescription)")
                 } else if let data = data, let image = NSImage(data: data) {
                     self.logger.log("Successfully loaded thumbnail data for \(fileName)")
+                    self.thumbnailCache[fileName] = image
                     self.items[index].thumbnail = image
                     return
                 }
-                
+
                 // Fallback: if the ICCameraFile already has a CGImage thumbnail, use it
                 if let cg = file.thumbnail {
                     self.logger.log("Using existing CGImage thumbnail for \(fileName)")
                     let rep = NSBitmapImageRep(cgImage: cg)
                     let image = NSImage(size: rep.size)
                     image.addRepresentation(rep)
+                    self.thumbnailCache[fileName] = image
                     self.items[index].thumbnail = image
                 } else {
                     self.logger.log("No thumbnail available for \(fileName)")
@@ -231,15 +360,15 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
             }
         }
     }
-    
+
     private func rebuildFileMap() {
         fileToIndexMap.removeAll()
         thumbnailRequests.removeAll()
-        
+
         // Rebuild mapping from current items and camera contents
         guard let contents = camera.contents else { return }
         let files = flatten(items: contents)
-        
+
         for (index, item) in items.enumerated() {
             if let file = files.first(where: { $0.name == item.name }) {
                 fileToIndexMap[file] = index
@@ -250,11 +379,11 @@ final class IOSMediaLibrary: NSObject, ObservableObject {
 
 // MARK: - ICDeviceDelegate
 extension IOSMediaLibrary: ICDeviceDelegate {
-    
+
     func deviceDidBecomeReady(_ device: ICDevice) {
         logger.log("Device became ready: \(device.name ?? "Unknown")")
     }
-    
+
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
         if let error = error {
             logger.log("Failed to open session: \(error.localizedDescription)")
@@ -266,7 +395,7 @@ extension IOSMediaLibrary: ICDeviceDelegate {
             self.processDeviceContents()
         }
     }
-    
+
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
         self.sessionOpened = false
         if let error = error {
@@ -275,7 +404,7 @@ extension IOSMediaLibrary: ICDeviceDelegate {
             logger.log("Session closed successfully")
         }
     }
-    
+
     func didRemove(_ device: ICDevice) {
         logger.log("Device removed: \(device.name ?? "Unknown")")
         self.items.removeAll()
@@ -283,9 +412,8 @@ extension IOSMediaLibrary: ICDeviceDelegate {
         self.thumbnailRequests.removeAll()
         self.isLoading = false
     }
-    
+
     func device(_ device: ICDevice, didReceiveStatus status: [AnyHashable : Any]?) {
-        // Optional: Handle status updates
         if let status = status {
             logger.log("Device status update: \(status)")
         }
@@ -294,64 +422,79 @@ extension IOSMediaLibrary: ICDeviceDelegate {
 
 // MARK: - ICCameraDeviceDelegate
 extension IOSMediaLibrary: ICCameraDeviceDelegate {
+    func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {
+       // <#code#>
+    }
     
+
     func cameraDeviceDidBecomeReady(_ camera: ICCameraDevice) {
         logger.log("Camera device ready: \(camera.name ?? "Unknown")")
         self.processDeviceContents()
     }
-    
+
     func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         logger.log("Device ready with complete content catalog")
         self.processDeviceContents()
     }
-    
+
     func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {
         logger.log("Access restriction removed")
         self.processDeviceContents()
     }
-    
+
     func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {
         logger.log("Access restriction enabled - clearing content")
         self.items.removeAll()
         self.fileToIndexMap.removeAll()
         self.thumbnailRequests.removeAll()
     }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {
         let files = flatten(items: items)
         logger.log("Adding \(files.count) new files")
         self.processFiles(files)
+
+        // Update per-folder maps for incremental adds
+        if let contents = camera.contents {
+            buildFolders(from: contents)
+        }
     }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {
         var indicesToRemove: [Int] = []
         for item in items {
             if let file = item as? ICCameraFile, let index = self.fileToIndexMap[file] {
                 indicesToRemove.append(index)
                 self.fileToIndexMap.removeValue(forKey: file)
+                if let name = file.name {
+                    self.thumbnailCache.removeValue(forKey: name)
+                }
             }
         }
-        
+
         // Remove items in reverse order to maintain indices
         for index in indicesToRemove.sorted(by: >) {
             if index < self.items.count {
                 self.items.remove(at: index)
             }
         }
-        
-        // Rebuild file map with new indices
+
+        // Rebuild maps
         self.rebuildFileMap()
+        if let contents = camera.contents {
+            buildFolders(from: contents)
+        }
     }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didRenameItems items: [ICCameraItem]) {
         logger.log("Items renamed, refreshing content")
-        // For simplicity, we'll refresh all content when items are renamed
         self.items.removeAll()
         self.fileToIndexMap.removeAll()
         self.thumbnailRequests.removeAll()
+        self.thumbnailCache.removeAll()
         self.processDeviceContents()
     }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didReceiveThumbnail thumbnail: CGImage?, for item: ICCameraItem, error: Error?) {
         guard let file = item as? ICCameraFile,
               let thumbnail = thumbnail,
@@ -362,33 +505,32 @@ extension IOSMediaLibrary: ICCameraDeviceDelegate {
             }
             return
         }
-        
+
         logger.log("Received CGImage thumbnail for: \(item.name ?? "unknown")")
         let rep = NSBitmapImageRep(cgImage: thumbnail)
         let image = NSImage(size: rep.size)
         image.addRepresentation(rep)
+        if let name = file.name {
+            thumbnailCache[name] = image
+        }
         self.items[index].thumbnail = image
     }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didReceiveMetadata metadata: [AnyHashable : Any]?, for item: ICCameraItem, error: Error?) {
-        // Optional: Process metadata if needed
         if let error = error {
             logger.log("Metadata error for item: \(error.localizedDescription)")
         }
     }
-    
-    func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {
-        // Optional: Handle PTP events
-    }
-    
+
     func cameraDevice(_ camera: ICCameraDevice, didEncounterError error: Error?) {
         if let error = error {
             self.logger.log("Camera error: \(error.localizedDescription)")
             self.errorMessage = error.localizedDescription
         }
     }
-    
+
     func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {
         logger.log("Camera capability changed")
     }
 }
+

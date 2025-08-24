@@ -1,4 +1,3 @@
-//
 //  Models.swift
 //  DeviceScanner
 //
@@ -43,7 +42,7 @@ enum MediaKind: String, CaseIterable {
     case photo
     case video
     case unknown
-    
+
     var displayName: String {
         switch self {
         case .photo: return "Photo"
@@ -62,7 +61,7 @@ struct IOSMediaItem: Identifiable, Hashable {
     let pixelHeight: Int?
     let kind: MediaKind
     var thumbnail: NSImage?
-    
+
     static func == (lhs: IOSMediaItem, rhs: IOSMediaItem) -> Bool {
         return lhs.id == rhs.id
     }
@@ -71,3 +70,17 @@ struct IOSMediaItem: Identifiable, Hashable {
         hasher.combine(id)
     }
 }
+
+// MARK: - Folders
+
+/// Stable identifier for a camera folder for this session.
+typealias IOSFolderID = String
+
+struct IOSMediaFolder: Identifiable, Hashable {
+    let id: IOSFolderID
+    let name: String
+    let totalCount: Int
+    let hasPhotos: Bool
+    let hasVideos: Bool
+}
+
