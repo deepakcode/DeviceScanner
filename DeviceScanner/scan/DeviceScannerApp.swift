@@ -1,3 +1,9 @@
+//
+//  DeviceScannerApp.swift
+//  DeviceScanner
+//
+//  Created by Kaden on 2/28/24.
+//
 
 import SwiftUI
 

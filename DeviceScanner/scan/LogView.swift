@@ -1,4 +1,12 @@
+//
+//  LogView.swift
+//  DeviceScanner
+//
+//  Created by Kaden on 2/28/24.
+//
+
 import SwiftUI
+import AppKit
 
 struct LogView: View {
     let logText: String
@@ -44,3 +52,4 @@ struct LogView: View {
         .frame(minWidth: 640, minHeight: 420)
     }
 }
+        

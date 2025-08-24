@@ -1,3 +1,9 @@
+//
+//  ContentView.swift
+//  DeviceScanner
+//
+//  Created by Kaden on 2/28/24.
+//
 
 import SwiftUI
 import AppKit
@@ -7,55 +13,63 @@ struct ContentView: View {
     @State private var timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
-            if manager.externalDrives.isEmpty && manager.iosDevices.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        if !manager.externalDrives.isEmpty {
-                            Section {
-                                ForEach(manager.externalDrives) { drive in
-                                    DriveRow(drive: drive)
-                                        .padding(12)
-                                        .background(.thinMaterial)
-                                        .cornerRadius(12)
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                if manager.externalDrives.isEmpty && manager.iosDevices.isEmpty {
+                    emptyState
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 24) {
+                            if !manager.externalDrives.isEmpty {
+                                Section {
+                                    ForEach(manager.externalDrives) { drive in
+                                        DriveRow(drive: drive)
+                                            .padding(12)
+                                            .background(.thinMaterial)
+                                            .cornerRadius(12)
+                                    }
+                                } header: {
+                                    Text("External Drives")
+                                        .font(.headline)
                                 }
-                            } header: {
-                                Text("External Drives")
-                                    .font(.headline)
+                            }
+                            if !manager.iosDevices.isEmpty {
+                                Section {
+                                    ForEach(manager.iosDevices) { device in
+                                        NavigationLink(value: device) {
+                                            IOSDeviceRow(device: device)
+                                                .padding(12)
+                                                .background(.thinMaterial)
+                                                .cornerRadius(12)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                } header: {
+                                    Text("iOS Devices")
+                                        .font(.headline)
+                                }
                             }
                         }
-                        if !manager.iosDevices.isEmpty {
-                            Section {
-                                ForEach(manager.iosDevices) { dev in
-                                    IOSDeviceRow(device: dev)
-                                        .padding(12)
-                                        .background(.thinMaterial)
-                                        .cornerRadius(12)
-                                }
-                            } header: {
-                                Text("iOS Devices")
-                                    .font(.headline)
-                            }
-                        }
+                        .padding(.top, 8)
                     }
-                    .padding(.top, 8)
                 }
             }
-        }
-        .padding(20)
-        .frame(minWidth: 640, minHeight: 420)
-        .onAppear {
-            manager.scan()
-        }
-        .onReceive(timer) { _ in
-            manager.scan()
-        }
-        .sheet(isPresented: $manager.showLogs) {
-            LogView(logText: manager.logger.allText) {
-                SavePanel.save(text: manager.logger.allText, suggestedFileName: "DeviceScanner-logs.txt")
+            .padding(20)
+            .frame(minWidth: 800, minHeight: 520)
+            .onAppear {
+                manager.scan()
+            }
+            .onReceive(timer) { _ in
+                manager.scan()
+            }
+            .sheet(isPresented: $manager.showLogs) {
+                LogView(logText: manager.logger.allText) {
+                    SavePanel.save(text: manager.logger.allText, suggestedFileName: "DeviceScanner-logs.txt")
+                }
+            }
+            .navigationDestination(for: IOSDevice.self) { device in
+                DeviceMediaView(device: device)
             }
         }
     }
@@ -92,7 +106,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("No devices found")
                 .font(.title3).bold()
-            Text("Connect a pendrive or an iPhone/iPad to see it here.")
+            Text("Connect a flash drive or an iPhone/iPad to see it here.")
                 .foregroundStyle(.secondary)
             HStack(spacing: 12) {
                 Button {
@@ -133,6 +147,7 @@ private struct DriveRow: View {
         HStack(spacing: 16) {
             Image(systemName: "externaldrive.fill")
                 .font(.system(size: 32))
+                .foregroundStyle(.blue)
             VStack(alignment: .leading, spacing: 4) {
                 Text(drive.name)
                     .font(.headline)
@@ -169,6 +184,7 @@ private struct IOSDeviceRow: View {
         HStack(spacing: 16) {
             Image(systemName: "iphone.gen3")
                 .font(.system(size: 32))
+                .foregroundStyle(.blue)
             VStack(alignment: .leading, spacing: 4) {
                 Text(device.name)
                     .font(.headline)
@@ -177,8 +193,14 @@ private struct IOSDeviceRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Text("Click to view photos & videos")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
             Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }

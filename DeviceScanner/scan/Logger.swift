@@ -1,10 +1,16 @@
+//
+//  Logger.swift
+//  DeviceScanner
+//
+//  Created by Kaden on 2/28/24.
+//
 
 import Foundation
 import AppKit
 
 @MainActor
-final class Logger {
-    private(set) var lines: [String] = []
+final class Logger: ObservableObject {
+    @Published private(set) var lines: [String] = []
 
     var allText: String {
         lines.joined(separator: "\n")
@@ -15,6 +21,11 @@ final class Logger {
         let entry = "[\(stamp)] \(message)"
         lines.append(entry)
         print(entry)
+        
+        // Keep only last 1000 lines to prevent memory issues
+        if lines.count > 1000 {
+            lines.removeFirst(lines.count - 1000)
+        }
     }
 
     func clear() {

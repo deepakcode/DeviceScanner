@@ -1,5 +1,12 @@
+//
+//  Models.swift
+//  DeviceScanner
+//
+//  Created by Kaden on 2/28/24.
+//
 
 import Foundation
+import AppKit
 
 struct ExternalDrive: Identifiable, Hashable {
     let id = UUID()
@@ -29,5 +36,38 @@ enum ByteFormat {
         if gb < 1024 { return String(format: "%.2f GB", gb) }
         let tb = gb / 1024.0
         return String(format: "%.2f TB", tb)
+    }
+}
+
+enum MediaKind: String, CaseIterable {
+    case photo
+    case video
+    case unknown
+    
+    var displayName: String {
+        switch self {
+        case .photo: return "Photo"
+        case .video: return "Video"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+struct IOSMediaItem: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let byteSize: Int64?
+    let created: Date?
+    let pixelWidth: Int?
+    let pixelHeight: Int?
+    let kind: MediaKind
+    var thumbnail: NSImage?
+    
+    static func == (lhs: IOSMediaItem, rhs: IOSMediaItem) -> Bool {
+        return lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
     }
 }
