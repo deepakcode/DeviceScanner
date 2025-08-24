@@ -69,7 +69,9 @@ struct ContentView: View {
                 }
             }
             .navigationDestination(for: IOSDevice.self) { device in
-                DeviceMediaView(device: device)
+                // Use a wrapper screen that resolves ICCameraDevice via DeviceManager
+                DeviceMediaScreen(device: device)
+                    .environmentObject(manager)
             }
         }
     }
@@ -201,6 +203,26 @@ private struct IOSDeviceRow: View {
             Image(systemName: "chevron.right")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Wrapper screen that resolves the actual `ICCameraDevice` and builds `IOSMediaLibrary`.
+private struct DeviceMediaScreen: View {
+    let device: IOSDevice
+    @EnvironmentObject var manager: DeviceManager
+
+    var body: some View {
+        Group {
+            if let library = manager.makeMediaLibrary(for: device) {
+                DeviceMediaView(library: library)
+            } else {
+                FriendlyUnavailableView(
+                    title: "Device unavailable",
+                    systemImage: "iphone.exclamationmark",
+                    description: Text("This iOS device is no longer connected. Please reconnect, unlock it, and tap “Trust”.")
+                )
+            }
         }
     }
 }
